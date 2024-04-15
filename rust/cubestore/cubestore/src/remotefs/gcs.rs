@@ -4,9 +4,9 @@ use crate::remotefs::{CommonRemoteFsUtils, LocalDirRemoteFs, RemoteFile, RemoteF
 use crate::util::lock::acquire_lock;
 use crate::CubeError;
 use async_trait::async_trait;
-use cloud_storage::Object;
+use cloud_storage::{ListRequest, Object};
 use datafusion::cube_ext;
-use futures::StreamExt;
+use futures::{TryStreamExt, StreamExt};
 use log::{debug, info};
 use regex::{NoExpand, Regex};
 use std::path::{Path, PathBuf};
@@ -19,77 +19,6 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-static INIT_CREDENTIALS: Once = Once::new();
-fn ensure_credentials_init() {
-    // The cloud storage library uses env vars to get access tokens.
-    // We decided CubeStore needs its own alias for it, so rewrite and hope no one read it before.
-    // TODO: switch to something that allows to configure without env vars.
-    // TODO: remove `SERVICE_ACCOUNT` completely.
-    INIT_CREDENTIALS.call_once(|| {
-        let mut creds_json = None;
-        if let Ok(c) = std::env::var("CUBESTORE_GCP_CREDENTIALS") {
-            match decode_credentials(&c) {
-                Ok(s) => creds_json = Some((s, "CUBESTORE_GCP_CREDENTIALS".to_string())),
-                Err(e) => log::error!("Could not decode 'CUBESTORE_GCP_CREDENTIALS': {}", e),
-            }
-        }
-        let mut creds_path = match std::env::var("CUBESTORE_GCP_KEY_FILE") {
-            Ok(s) => Some((s, "CUBESTORE_GCP_KEY_FILE".to_string())),
-            Err(_) => None,
-        };
-
-        // TODO: this handles deprecated variable names, remove them.
-        for (var, is_path) in &[
-            ("SERVICE_ACCOUNT", true),
-            ("GOOGLE_APPLICATION_CREDENTIALS", true),
-            ("SERVICE_ACCOUNT_JSON", false),
-            ("GOOGLE_APPLICATION_CREDENTIALS_JSON", false),
-        ] {
-            for var in &[&format!("CUBESTORE_GCP_{}", var), *var] {
-                if let Ok(var_value) = std::env::var(&var) {
-                    let (upgrade_var, read_value) = if *is_path {
-                        ("CUBESTORE_GCP_KEY_FILE", &mut creds_path)
-                    } else {
-                        ("CUBESTORE_GCP_CREDENTIALS", &mut creds_json)
-                    };
-
-                    match read_value {
-                        None => {
-                            *read_value = Some((var_value, var.to_string()));
-                            log::warn!(
-                                "Environment variable '{}' is deprecated and will be ignored in future versions, use '{}' instead",
-                                var,
-                                upgrade_var
-                            );
-                        }
-                        Some((prev_val, prev_var)) => {
-                            if prev_val != &var_value {
-                                log::warn!(
-                                    "Values of '{}' and '{}' differ, preferring the latter",
-                                    var,
-                                    prev_var
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        match creds_json {
-            Some((v, _)) => std::env::set_var("SERVICE_ACCOUNT_JSON", v),
-            None => std::env::remove_var("SERVICE_ACCOUNT_JSON"),
-        }
-        match creds_path {
-            Some((v, _)) => std::env::set_var("SERVICE_ACCOUNT", v),
-            None => std::env::remove_var("SERVICE_ACCOUNT"),
-        }
-    })
-}
-
-fn decode_credentials(creds_base64: &str) -> Result<String, CubeError> {
-    Ok(String::from_utf8(base64::decode(creds_base64)?)?)
-}
 
 #[derive(Debug)]
 pub struct GCSRemoteFs {
@@ -105,7 +34,6 @@ impl GCSRemoteFs {
         bucket_name: String,
         sub_path: Option<String>,
     ) -> Result<Arc<Self>, CubeError> {
-        ensure_credentials_init();
         Ok(Arc::new(Self {
             dir,
             bucket: bucket_name.to_string(),
@@ -270,45 +198,45 @@ impl RemoteFs for GCSRemoteFs {
     }
 
     async fn list_with_metadata(
-        &self,
-        remote_prefix: String,
-    ) -> Result<Vec<RemoteFile>, CubeError> {
-        let prefix = self.gcs_path(&remote_prefix);
-        let list = Object::list_prefix(self.bucket.as_str(), prefix.as_str()).await?;
-        let leading_slash = Regex::new(format!("^{}", self.gcs_path("")).as_str()).unwrap();
-        let result = list
-            .map(|objects| -> Result<Vec<RemoteFile>, CubeError> {
-                Ok(objects?
-                    .into_iter()
-                    .map(|obj| RemoteFile {
-                        remote_path: leading_slash.replace(&obj.name, NoExpand("")).to_string(),
-                        updated: obj.updated.clone(),
-                        file_size: obj.size,
-                    })
-                    .collect())
-            })
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect::<Vec<_>>();
-        let mut pages_count = result.len() / 1_000;
-        if result.len() % 1_000 > 0 {
-            pages_count += 1;
+            &self,
+            remote_prefix: String,
+        ) -> Result<Vec<RemoteFile>, CubeError> {
+            let prefix = self.gcs_path(&remote_prefix);
+            let request = ListRequest {
+                prefix: Some(prefix.into()),
+                ..Default::default()
+            };
+            let list= Object::list(self.bucket.as_str(), request)
+                .await?
+                .map_ok(|object_list| object_list.items)
+                .try_concat()
+                .await?;
+
+            let leading_slash = Regex::new(format!("^{}", self.gcs_path("")).as_str()).unwrap();
+            let result: Vec<RemoteFile> = list.into_iter()
+                .map(|obj| RemoteFile {
+                    remote_path: leading_slash.replace(&obj.name, NoExpand("")).to_string(),
+                    updated: obj.updated.clone(),
+                    file_size: obj.size,
+                })
+                .collect::<Vec<RemoteFile>>();
+
+            let mut pages_count = result.len() / 1_000;
+            if result.len() % 1_000 > 0 {
+                pages_count += 1;
+            }
+            if pages_count > 100 {
+                log::warn!("gcs list returned more than 100 pages: {}", pages_count);
+            }
+            app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
+                pages_count as i64,
+                Some(&vec![
+                    "operation:list".to_string(),
+                    "driver:gcs".to_string(),
+                ]),
+            );
+            Ok(result)
         }
-        if pages_count > 100 {
-            log::warn!("S3 list returned more than 100 pages: {}", pages_count);
-        }
-        app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
-            pages_count as i64,
-            Some(&vec![
-                "operation:list".to_string(),
-                "driver:gcs".to_string(),
-            ]),
-        );
-        Ok(result)
-    }
 
     async fn local_path(&self) -> Result<String, CubeError> {
         Ok(self.dir.to_str().unwrap().to_owned())

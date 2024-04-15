@@ -5,6 +5,5 @@ members = [
     "cubestore-sql-tests",
     "cubehll",
     "cubezetasketch",
-    "cuberpc",
-    "cuberockstore",
+    "cuberpc"
 ]
