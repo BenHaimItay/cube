@@ -14,6 +14,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::codec::{BytesCodec, FramedRead};
+use crate::util::lock::acquire_lock;
 use crate::{CubeError, app_metrics, remotefs::{CommonRemoteFsUtils, LocalDirRemoteFs, RemoteFs, RemoteFile}, di_service};
 
 static INIT_CREDENTIALS: Once = Once::new();
