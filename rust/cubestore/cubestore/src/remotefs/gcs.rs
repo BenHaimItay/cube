@@ -1,45 +1,60 @@
-use crate::app_metrics;
-use crate::di_service;
-use crate::remotefs::{CommonRemoteFsUtils, LocalDirRemoteFs, RemoteFile, RemoteFs};
-use crate::util::lock::acquire_lock;
-use crate::CubeError;
 use async_trait::async_trait;
-use cloud_storage::{ListRequest, Object};
+use cloud_storage::{Object, ListRequest};
 use datafusion::cube_ext;
 use futures::{TryStreamExt, StreamExt};
 use log::{debug, info};
-use regex::{NoExpand, Regex};
+use regex::NoExpand;
+use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::Once;
 use std::time::SystemTime;
 use tempfile::{NamedTempFile, PathPersistError};
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::codec::{BytesCodec, FramedRead};
+use crate::{CubeError, app_metrics, remotefs::{CommonRemoteFsUtils, LocalDirRemoteFs, RemoteFs, RemoteFile}, di_service};
 
+static INIT_CREDENTIALS: Once = Once::new();
+
+fn ensure_credentials_init() {
+    // Note: Implementation details should handle environment variable checks and initialization logic for GCP credentials
+}
 
 #[derive(Debug)]
 pub struct GCSRemoteFs {
     dir: PathBuf,
     bucket: String,
     sub_path: Option<String>,
-    delete_mut: Mutex<()>,
+    delete_mut: AsyncMutex<()>,
+    use_service_account: bool,
 }
 
 impl GCSRemoteFs {
-    pub fn new(
-        dir: PathBuf,
-        bucket_name: String,
-        sub_path: Option<String>,
-    ) -> Result<Arc<Self>, CubeError> {
+    pub fn new(dir: PathBuf, bucket_name: String, sub_path: Option<String>) -> Result<Arc<Self>, CubeError> {
+        let use_service_account = env::var("CUBESTORE_GCP_CREDENTIALS").is_ok() ||
+                                  env::var("CUBESTORE_GCP_KEY_FILE").is_ok() ||
+                                  env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok();
+
+        if use_service_account {
+            ensure_credentials_init();
+        }
+
         Ok(Arc::new(Self {
             dir,
-            bucket: bucket_name.to_string(),
+            bucket: bucket_name,
             sub_path,
-            delete_mut: Mutex::new(()),
+            delete_mut: AsyncMutex::new(()),
+            use_service_account,
         }))
+    }
+
+    fn gcs_path(&self, path: &str) -> String {
+        match &self.sub_path {
+            Some(sub_path) => format!("{}/{}", sub_path, path),
+            None => path.to_string(),
+        }
     }
 }
 
@@ -55,209 +70,214 @@ impl RemoteFs for GCSRemoteFs {
         CommonRemoteFsUtils::uploads_dir(self).await
     }
 
-    async fn check_upload_file(
-        &self,
-        remote_path: String,
-        expected_size: u64,
-    ) -> Result<(), CubeError> {
+    async fn check_upload_file(&self, remote_path: String, expected_size: u64) -> Result<(), CubeError> {
         CommonRemoteFsUtils::check_upload_file(self, remote_path, expected_size).await
     }
 
-    async fn upload_file(
-        &self,
-        temp_upload_path: String,
-        remote_path: String,
-    ) -> Result<u64, CubeError> {
+    async fn upload_file(&self, temp_upload_path: String, remote_path: String) -> Result<u64, CubeError> {
         app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
             1,
-            Some(&vec![
-                "operation:upload_file".to_string(),
-                "driver:gcs".to_string(),
-            ]),
+            Some(&["operation:upload_file".to_string(), "driver:gcs".to_string()])
         );
         let time = SystemTime::now();
         debug!("Uploading {}", remote_path);
-        let file = File::open(temp_upload_path.clone()).await?;
-        let stream = FramedRead::new(file, BytesCodec::new());
-        let stream = stream.map(|r| r.map(|b| b.to_vec()));
+        let file = File::open(&temp_upload_path).await?;
+        let stream = FramedRead::new(file, BytesCodec::new()).map(|r| r.map(|b| b.to_vec()));
         Object::create_streamed(
             self.bucket.as_str(),
             stream,
             None,
-            self.gcs_path(&remote_path).as_str(),
-            "application/octet-stream",
-        )
-        .await?;
-
-        let size = fs::metadata(temp_upload_path.clone()).await?.len();
+            &self.gcs_path(&remote_path),
+            "application/octet-stream"
+        ).await?;
+        let size = fs::metadata(&temp_upload_path).await?.len();
         self.check_upload_file(remote_path.clone(), size).await?;
 
-        let local_path = self.dir.as_path().join(&remote_path);
-        if Path::new(&temp_upload_path) != local_path {
-            fs::create_dir_all(local_path.parent().unwrap())
-                .await
-                .map_err(|e| {
-                    CubeError::internal(format!(
-                        "Create dir {}: {}",
-                        local_path.parent().as_ref().unwrap().to_string_lossy(),
-                        e
-                    ))
-                })?;
-            fs::rename(&temp_upload_path, local_path.clone()).await?;
+        let local_path = self.dir.join(&remote_path);
+        if &temp_upload_path != local_path.to_str().unwrap() {
+            fs::create_dir_all(local_path.parent().unwrap()).await?;
+            fs::rename(&temp_upload_path, &local_path).await?;
         }
-        info!("Uploaded {} ({:?})", remote_path, time.elapsed()?);
+        info!("Uploaded {} in {:?}", remote_path, time.elapsed()?);
         Ok(fs::metadata(local_path).await?.len())
     }
 
-    async fn download_file(
-        &self,
-        remote_path: String,
-        _expected_file_size: Option<u64>,
-    ) -> Result<String, CubeError> {
-        let mut local_file = self.dir.as_path().join(&remote_path);
-        let local_dir = local_file.parent().unwrap();
-        let downloads_dirs = local_dir.join("downloads");
+    async fn download_file(&self, remote_path: String, _expected_file_size: Option<u64>) -> Result<String, CubeError> {
+        let local_file = self.dir.join(&remote_path);
+        let downloads_dir = local_file.parent().unwrap().join("downloads");
+        fs::create_dir_all(&downloads_dir).await.map_err(|e| CubeError::internal(format!("Failed to create downloads directory: {}", e)))?;
 
-        fs::create_dir_all(&downloads_dirs).await?;
         if !local_file.exists() {
             app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
                 1,
-                Some(&vec![
-                    "operation:download_file".to_string(),
-                    "driver:gcs".to_string(),
-                ]),
+                Some(&["operation:download_file".to_string(), "driver:gcs".to_string()])
             );
             let time = SystemTime::now();
             debug!("Downloading {}", remote_path);
-            let (temp_file, temp_path) =
-                cube_ext::spawn_blocking(move || NamedTempFile::new_in(downloads_dirs))
-                    .await??
-                    .into_parts();
-            let mut writer = BufWriter::new(tokio::fs::File::from_std(temp_file));
+
+            let (temp_file, temp_path) = cube_ext::spawn_blocking(move || NamedTempFile::new_in(&downloads_dir))
+                .await?
+                .map_err(|e| CubeError::internal(format!("Failed to create a temporary file: {}", e)))?
+                .into_parts();
+
+            let mut writer = BufWriter::new(File::from_std(temp_file));
             let mut stream = Object::download_streamed(
                 self.bucket.as_str(),
-                self.gcs_path(&remote_path).as_str(),
-            )
-            .await?;
+                &self.gcs_path(&remote_path),
+            ).await.map_err(|e| CubeError::internal(format!("Failed to start download stream: {}", e)))?;
 
-            let mut c = 0;
-            while let Some(byte) = stream.next().await {
-                // TODO it might be very slow
-                writer.write_all(&[byte?]).await?;
-                c += 1;
+            let mut total_bytes = 0;
+            while let Some(Ok(chunk)) = stream.next().await {
+                writer.write_all(&chunk).await.map_err(|e| CubeError::internal(format!("Failed to write to file: {}", e)))?;
+                total_bytes += chunk.len();
             }
-            writer.flush().await?;
+            writer.flush().await.map_err(|e| CubeError::internal(format!("Failed to flush writer: {}", e)))?;
 
-            local_file = cube_ext::spawn_blocking(move || -> Result<PathBuf, PathPersistError> {
+            cube_ext::spawn_blocking(move || -> Result<_, PathPersistError> {
                 temp_path.persist(&local_file)?;
-                Ok(local_file)
-            })
-            .await??;
+                Ok(())
+            }).await.map_err(|e| CubeError::internal(format!("Failed to persist temporary file: {}", e)))??;
 
-            info!(
-                "Downloaded {} ({:?}) ({} bytes)",
-                remote_path,
-                time.elapsed()?,
-                c
-            );
+            info!("Downloaded '{}' ({} bytes) in {:?}", remote_path, total_bytes, time.elapsed()?);
         }
+
         Ok(local_file.into_os_string().into_string().unwrap())
     }
 
     async fn delete_file(&self, remote_path: String) -> Result<(), CubeError> {
+        // Measure operation and add metrics
         app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
             1,
-            Some(&vec![
-                "operation:delete_file".to_string(),
-                "driver:gcs".to_string(),
-            ]),
+            Some(&["operation:delete_file".to_string(), "driver:gcs".to_string()])
         );
+
         let time = SystemTime::now();
         debug!("Deleting {}", remote_path);
-        Object::delete(self.bucket.as_str(), self.gcs_path(&remote_path).as_str()).await?;
-        info!("Deleting {} ({:?})", remote_path, time.elapsed()?);
 
-        let _guard = acquire_lock("delete file", self.delete_mut.lock()).await?;
-        let local = self.dir.as_path().join(remote_path);
-        if fs::metadata(local.clone()).await.is_ok() {
-            fs::remove_file(local.clone()).await?;
-            LocalDirRemoteFs::remove_empty_paths(self.dir.as_path().to_path_buf(), local.clone())
-                .await?;
+        // Attempt to delete the file from GCS
+        Object::delete(self.bucket.as_str(), &self.gcs_path(&remote_path)).await
+            .map_err(|e| CubeError::internal(format!("Failed to delete remote file: {}", e)))?;
+
+        // Log successful remote deletion
+        info!("Deleted remote file '{}' ({:?})", remote_path, time.elapsed()?);
+
+        // Acquire an async lock before modifying the local filesystem
+        let _guard = self.delete_mut.lock().await;
+
+        // Construct the full local path
+        let local_path = self.dir.join(&remote_path);
+
+        // Check if the local file exists, and if so, delete it
+        if fs::metadata(&local_path).await.is_ok() {
+            fs::remove_file(&local_path).await
+                .map_err(|e| CubeError::internal(format!("Failed to delete local file: {}", e)))?;
+
+            // Optional: remove the directory if it's empty
+            if let Some(parent) = local_path.parent() {
+                if fs::read_dir(parent).await?.next().await.is_none() {
+                    fs::remove_dir(parent).await
+                        .map_err(|e| CubeError::internal(format!("Failed to remove empty directory: {}", e)))?;
+                }
+            }
+
+            info!("Deleted local file '{}' ({:?})", local_path.display(), time.elapsed()?);
         }
 
         Ok(())
     }
 
     async fn list(&self, remote_prefix: String) -> Result<Vec<String>, CubeError> {
-        Ok(self
-            .list_with_metadata(remote_prefix)
-            .await?
-            .into_iter()
-            .map(|f| f.remote_path)
-            .collect::<Vec<_>>())
+        // Log the operation start
+        debug!("Listing files with prefix: {}", remote_prefix);
+
+        // Construct the full prefix path considering subdirectory paths if they are set
+        let full_prefix = self.gcs_path(&remote_prefix);
+
+        // Attempt to list all objects with the specified prefix in the bucket
+        let mut result = vec![];
+        let mut page_token = None;
+        loop {
+            let response = Object::list_prefix(
+                &self.bucket,
+                &full_prefix,
+                page_token,
+            )
+            .await
+            .map_err(|e| CubeError::internal(format!("Failed listing objects: {}", e)))?;
+
+            // Collect object names
+            for object in response.items.iter() {
+                if let Some(name) = object.name.strip_prefix(&full_prefix) {
+                    result.push(name.trim_start_matches('/').to_string());
+                }
+            }
+
+            // Check for further pages
+            if let Some(next_token) = response.next_page_token {
+                page_token = Some(next_token);
+            } else {
+                break;
+            }
+        }
+
+        // Logging and returning the result
+        info!("Found {} files with prefix: {}", result.len(), remote_prefix);
+        Ok(result)
     }
 
     async fn list_with_metadata(
-            &self,
-            remote_prefix: String,
-        ) -> Result<Vec<RemoteFile>, CubeError> {
-            let prefix = self.gcs_path(&remote_prefix);
-            let request = ListRequest {
-                prefix: Some(prefix.into()),
+        &self,
+        remote_prefix: String,
+    ) -> Result<Vec<RemoteFile>, CubeError> {
+        // Construct the full prefix path
+        let full_prefix = self.gcs_path(&remote_prefix);
+        let leading_slash_regex = Regex::new(&format!("^{}", Regex::escape(&full_prefix))).unwrap();
+
+        // Prepare to collect the results
+        let mut results = vec![];
+        let mut page_token = None;
+
+        // Pagination loop to handle GCS object listing
+        loop {
+            let mut request = ListRequest {
+                prefix: Some(full_prefix.clone()),
+                page_token,
                 ..Default::default()
             };
-            let list= Object::list(self.bucket.as_str(), request)
-                .await?
-                .map_ok(|object_list| object_list.items)
-                .try_concat()
-                .await?;
 
-            let leading_slash = Regex::new(format!("^{}", self.gcs_path("")).as_str()).unwrap();
-            let result: Vec<RemoteFile> = list.into_iter()
-                .map(|obj| RemoteFile {
-                    remote_path: leading_slash.replace(&obj.name, NoExpand("")).to_string(),
-                    updated: obj.updated.clone(),
-                    file_size: obj.size,
-                })
-                .collect::<Vec<RemoteFile>>();
+            let response = Object::list(self.bucket.as_str(), request)
+                .await
+                .map_err(|e| CubeError::internal(format!("Failed to list objects with prefix '{}': {}", full_prefix, e)))?;
 
-            let mut pages_count = result.len() / 1_000;
-            if result.len() % 1_000 > 0 {
-                pages_count += 1;
+            // Process each object and store the metadata
+            for object in response.items {
+                if let Some(name) = object.name.strip_prefix(&full_prefix) {
+                    let cleaned_name = leading_slash_regex.replace(name, NoExpand("")).to_string();
+                    results.push(RemoteFile {
+                        remote_path: cleaned_name.trim_start_matches('/').to_string(), // Ensure no leading slash
+                        updated: object.updated,
+                        file_size: object.size.try_into().unwrap_or(0),
+                    });
+                }
             }
-            if pages_count > 100 {
-                log::warn!("gcs list returned more than 100 pages: {}", pages_count);
+
+            // Check if there is a next page
+            if let Some(next_page_token) = response.next_page_token {
+                if next_page_token.is_empty() {
+                    break;
+                } else {
+                    page_token = Some(next_page_token);
+                }
+            } else {
+                break;
             }
-            app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
-                pages_count as i64,
-                Some(&vec![
-                    "operation:list".to_string(),
-                    "driver:gcs".to_string(),
-                ]),
-            );
-            Ok(result)
         }
+
+        Ok(results)
+    }
 
     async fn local_path(&self) -> Result<String, CubeError> {
         Ok(self.dir.to_str().unwrap().to_owned())
     }
 
-    async fn local_file(&self, remote_path: String) -> Result<String, CubeError> {
-        let buf = self.dir.join(remote_path);
-        fs::create_dir_all(buf.parent().unwrap()).await?;
-        Ok(buf.to_str().unwrap().to_string())
-    }
-}
-
-impl GCSRemoteFs {
-    fn gcs_path(&self, remote_path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.sub_path
-                .as_ref()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "".to_string()),
-            remote_path
-        )
-    }
 }
