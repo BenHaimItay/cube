@@ -19,6 +19,26 @@ use crate::{CubeError, app_metrics, remotefs::{CommonRemoteFsUtils, LocalDirRemo
 
 static INIT_CREDENTIALS: Once = Once::new();
 
+enum CredentialsConfig {
+    None,
+    ServiceAccountPath(String),
+    ServiceAccountJson(String),
+}
+
+fn detect_credentials() -> CredentialsConfig {
+    if let Ok(path) = env::var("CUBESTORE_GCP_KEY_FILE") {
+        return CredentialsConfig::ServiceAccountPath(path);
+    }
+    else if let Ok(json) = env::var("CUBESTORE_GCP_CREDENTIALS") {
+        return CredentialsConfig::ServiceAccountJson(json);
+    }
+    else if let Ok(path) = env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+        return CredentialsConfig::ServiceAccountPath(path);
+    }
+    CredentialsConfig::None
+}
+
+
 fn ensure_credentials_init() {
     // The cloud storage library uses env vars to get access tokens.
     // We decided CubeStore needs its own alias for it, so rewrite and hope no one read it before.
@@ -101,12 +121,12 @@ pub struct GCSRemoteFs {
 
 impl GCSRemoteFs {
     pub fn new(dir: PathBuf, bucket_name: String, sub_path: Option<String>) -> Result<Arc<Self>, CubeError> {
-        let use_service_account = env::var("CUBESTORE_GCP_CREDENTIALS").is_ok() ||
-                                  env::var("CUBESTORE_GCP_KEY_FILE").is_ok() ||
-                                  env::var("GOOGLE_APPLICATION_CREDENTIALS").is_ok();
-
-        if use_service_account {
-            ensure_credentials_init();
+        let credentials = detect_credentials();
+        match credentials {
+            CredentialsConfig::ServiceAccountPath(_) | CredentialsConfig::ServiceAccountJson(_) => {
+                ensure_credentials_init();
+            },
+            _ => {}
         }
 
         Ok(Arc::new(Self {
@@ -114,7 +134,7 @@ impl GCSRemoteFs {
             bucket: bucket_name,
             sub_path,
             delete_mut: AsyncMutex::new(()),
-            use_service_account,
+            use_service_account: credentials != CredentialsConfig::None,
         }))
     }
 
