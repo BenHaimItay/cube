@@ -322,29 +322,11 @@ impl From<flexbuffers::SerializationError> for CubeError {
     }
 }
 
-impl From<s3::S3Error> for CubeError {
-    fn from(v: s3::S3Error) -> Self {
-        let mut m = format!("AWS S3 error: {}", v);
-        if let Some(data) = v.data {
-            m += ": ";
-            m += &data
-        }
-        CubeError::internal(m)
+impl From<s3::error::S3Error> for CubeError {
+    fn from(v: s3::error::S3Error) -> Self {
+        CubeError::internal(format!("AWS S3 error: {}", v.to_string()))
     }
 }
-
-impl From<awscreds::AwsCredsError> for CubeError {
-    fn from(v: awscreds::AwsCredsError) -> Self {
-        CubeError::user(v.to_string())
-    }
-}
-
-impl From<awsregion::AwsRegionError> for CubeError {
-    fn from(v: awsregion::AwsRegionError) -> Self {
-        CubeError::user(v.to_string())
-    }
-}
-
 impl From<chrono::ParseError> for CubeError {
     fn from(v: chrono::ParseError) -> Self {
         CubeError::from_error(v)
@@ -457,6 +439,12 @@ impl From<hex::FromHexError> for CubeError {
 
 impl From<HllError> for CubeError {
     fn from(v: HllError) -> Self {
+        return CubeError::from_error(v);
+    }
+}
+
+impl From<cubedatasketches::DataSketchesError> for CubeError {
+    fn from(v: cubedatasketches::DataSketchesError) -> Self {
         return CubeError::from_error(v);
     }
 }

@@ -47,6 +47,11 @@ const memberExpression = Joi.object().keys({
   name: Joi.string().required(),
   expressionName: Joi.string(),
   definition: Joi.string(),
+  groupingSet: Joi.object().keys({
+    groupType: Joi.valid('Rollup', 'Cube').required(),
+    id: Joi.number().required(),
+    subId: Joi.number()
+  })
 });
 
 const operators = [
@@ -108,7 +113,7 @@ const querySchema = Joi.object().keys({
   ),
   segments: Joi.array().items(Joi.alternatives(id, memberExpression)),
   timezone: Joi.string(),
-  limit: Joi.number().integer().min(1),
+  limit: Joi.number().integer().min(0),
   offset: Joi.number().integer().min(0),
   total: Joi.boolean(),
   renewQuery: Joi.boolean(),

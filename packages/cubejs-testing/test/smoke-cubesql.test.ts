@@ -223,5 +223,79 @@ ORDER BY
   `);
       expect(res.rows).toMatchSnapshot('metabase max number');
     });
+
+    test('power bi post aggregate measure wrap', async () => {
+      const res = await connection.query(`
+select 
+  "_"."createdAt", 
+  "_"."a0",
+  "_"."a1"
+from 
+  ( 
+    select 
+      "rows"."createdAt" as "createdAt", 
+      sum(cast("rows"."amountRankView" as decimal)) as "a0",
+      max("rows"."amountRankDate") as "a1" 
+    from 
+      ( 
+        select 
+          "_"."status", 
+          "_"."createdAt", 
+          "_"."amountRankView",
+          "_"."amountRankDate"
+        from 
+          "public"."Orders" "_" 
+        where 
+          "_"."status" = 'shipped'
+      ) "rows" 
+    group by 
+      "createdAt" 
+  ) "_" 
+where 
+  not "_"."a0" is null or
+  not "_"."a1" is null
+limit 
+  1000001
+  `);
+      expect(res.rows).toMatchSnapshot('power bi post aggregate measure wrap');
+    });
+
+    test('percentage of total sum', async () => {
+      const res = await connection.query(`
+select 
+  sum("OrdersView"."statusPercentageOfTotal") as "m0" 
+from 
+  "OrdersView" as "OrdersView" 
+  `);
+      expect(res.rows).toMatchSnapshot('percentage of total sum');
+    });
+
+    test('date/string measures in view', async () => {
+      const queryCtor = (column: string) => `SELECT "${column}" AS val FROM "OrdersView" ORDER BY "id" LIMIT 10`;
+
+      const resStr = await connection.query(queryCtor('countAndTotalAmount'));
+      expect(resStr.rows).toMatchSnapshot('string case');
+
+      const resDate = await connection.query(queryCtor('createdAtMaxProxy'));
+      expect(resDate.rows).toMatchSnapshot('date case');
+    });
+
+    test('zero limited dimension aggregated queries', async () => {
+      const query = 'SELECT MAX(createdAt) FROM Orders LIMIT 0';
+      const res = await connection.query(query);
+      expect(res.rows).toEqual([]);
+    });
+
+    test('select dimension agg where false', async () => {
+      const query = 'SELECT MAX("createdAt") AS "max" FROM "BigOrders" WHERE 1 = 0';
+      const res = await connection.query(query);
+      expect(res.rows).toEqual([{ max: null }]);
+    });
+
+    test('where segment is false', async () => {
+      const query = 'SELECT value AS val, * FROM "SegmentTest" WHERE segment_eq_1 IS FALSE ORDER BY value;';
+      const res = await connection.query(query);
+      expect(res.rows.map((x) => x.val)).toEqual([789, 987]);
+    });
   });
 });

@@ -88,6 +88,7 @@ use crate::cachestore::{
     CacheItem, QueueItem, QueueItemPayload, QueueItemStatus, QueueResult, QueueResultAckEvent,
 };
 use crate::remotefs::LocalDirRemoteFs;
+use cubedatasketches::HLLDataSketch;
 use deepsize::DeepSizeOf;
 use snapshot_info::SnapshotInfo;
 use std::time::{Duration, SystemTime};
@@ -342,10 +343,11 @@ impl DataFrameValue<String> for Option<Vec<AggregateFunction>> {
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq, Hash, DeepSizeOf)]
 pub enum HllFlavour {
-    Airlift,    // Compatible with Presto, Athena, etc.
-    Snowflake,  // Same storage as Airlift, imports from Snowflake JSON.
-    Postgres,   // Same storage as Airlift, imports from HLL Storage Specification.
-    ZetaSketch, // Compatible with BigQuery.
+    Airlift,      // Compatible with Presto, Athena, etc.
+    Snowflake,    // Same storage as Airlift, imports from Snowflake JSON.
+    Postgres,     // Same storage as Airlift, imports from HLL Storage Specification.
+    ZetaSketch,   // Compatible with BigQuery.
+    DataSketches, // Compatible with DataBricks.
 }
 
 pub fn is_valid_plain_binary_hll(data: &[u8], f: HllFlavour) -> Result<(), CubeError> {
@@ -359,6 +361,9 @@ pub fn is_valid_plain_binary_hll(data: &[u8], f: HllFlavour) -> Result<(), CubeE
         }
         HllFlavour::Postgres | HllFlavour::Snowflake => {
             panic!("string formats should be handled separately")
+        }
+        HllFlavour::DataSketches => {
+            HLLDataSketch::read(data)?;
         }
     }
     return Ok(());
@@ -391,6 +396,7 @@ impl Display for ColumnType {
             ColumnType::HyperLogLog(HllFlavour::ZetaSketch) => "hyperloglogpp",
             ColumnType::HyperLogLog(HllFlavour::Postgres) => "hll_postgres",
             ColumnType::HyperLogLog(HllFlavour::Snowflake) => "hll_snowflake",
+            ColumnType::HyperLogLog(HllFlavour::DataSketches) => "hll_datasketches",
             ColumnType::Timestamp => "timestamp",
             ColumnType::Float => "float",
             ColumnType::Boolean => "boolean",
@@ -436,6 +442,7 @@ impl ColumnType {
                 "hyperloglogpp" => Ok(ColumnType::HyperLogLog(HllFlavour::ZetaSketch)),
                 "hll_postgres" => Ok(ColumnType::HyperLogLog(HllFlavour::Postgres)),
                 "hll_snowflake" => Ok(ColumnType::HyperLogLog(HllFlavour::Snowflake)),
+                "hll_datasketches" => Ok(ColumnType::HyperLogLog(HllFlavour::DataSketches)),
                 "timestamp" => Ok(ColumnType::Timestamp),
                 "float" => Ok(ColumnType::Float),
                 "boolean" => Ok(ColumnType::Boolean),
@@ -597,6 +604,7 @@ impl fmt::Display for Column {
             ColumnType::HyperLogLog(HllFlavour::ZetaSketch) => "HYPERLOGLOGPP".to_string(),
             ColumnType::HyperLogLog(HllFlavour::Postgres) => "HLL_POSTGRES".to_string(),
             ColumnType::HyperLogLog(HllFlavour::Snowflake) => "HLL_SNOWFLAKE".to_string(),
+            ColumnType::HyperLogLog(HllFlavour::DataSketches) => "HLL_DATASKETCHES".to_string(),
             ColumnType::Float => "FLOAT".to_string(),
         };
         f.write_fmt(format_args!("{} {}", self.name, column_type))
@@ -5225,6 +5233,8 @@ mod tests {
 
     #[tokio::test]
     async fn table_test() {
+        init_test_logger().await;
+
         let config = Config::test("table_test");
         let store_path = env::current_dir().unwrap().join("test-table-local");
         let remote_store_path = env::current_dir().unwrap().join("test-table-remote");
@@ -5335,6 +5345,8 @@ mod tests {
     }
     #[tokio::test]
     async fn default_index_field_positions_test() {
+        init_test_logger().await;
+
         let config = Config::test("default_index_field_positions_test");
         let store_path = env::current_dir()
             .unwrap()
@@ -5426,6 +5438,8 @@ mod tests {
 
     #[tokio::test]
     async fn table_with_aggregate_index_test() {
+        init_test_logger().await;
+
         let config = Config::test("table_with_aggregate_index_test");
         let store_path = env::current_dir()
             .unwrap()
@@ -5616,6 +5630,8 @@ mod tests {
 
     #[tokio::test]
     async fn cold_start_test() {
+        init_test_logger().await;
+
         {
             let config = Config::test("cold_start_test");
 
@@ -5685,6 +5701,7 @@ mod tests {
                 .get_schema("bar".to_string())
                 .await
                 .unwrap();
+
             fs::remove_dir_all(config.local_dir()).unwrap();
             fs::remove_dir_all(config.remote_dir()).unwrap();
         }

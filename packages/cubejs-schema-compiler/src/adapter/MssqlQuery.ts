@@ -78,6 +78,7 @@ export class MssqlQuery extends BaseQuery {
     return new MssqlParamAllocator(expressionParams);
   }
 
+  // TODO replace with limitOffsetClause override
   public groupByDimensionLimit() {
     if (this.rowLimit) {
       return this.offset ? ` OFFSET ${parseInt(this.offset, 10)} ROWS FETCH NEXT ${parseInt(this.rowLimit, 10)} ROWS ONLY` : '';
@@ -101,6 +102,9 @@ export class MssqlQuery extends BaseQuery {
    * @override
    */
   public groupByClause() {
+    if (this.ungrouped) {
+      return '';
+    }
     const dimensionsForSelect = this.dimensionsForSelect();
     const dimensionColumns = R.flatten(
       dimensionsForSelect.map(s => s.selectColumns() && s.dimensionSql())

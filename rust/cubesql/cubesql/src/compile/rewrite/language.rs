@@ -469,6 +469,15 @@ macro_rules! variant_field_struct {
         );
     };
 
+    ($variant:ident, $var_field:ident, GroupingSetType) => {
+        $crate::variant_field_struct!(
+            @enum_struct $variant, $var_field, { GroupingSetType } -> {
+                GroupingSetType::Rollup => "Rollup",
+                GroupingSetType::Cube => "Cube",
+            }
+        );
+    };
+
     (@enum_struct $variant:ident, $var_field:ident, { $var_field_type:ty } -> {$($variant_type:ty => $name:literal,)*}) => {
         paste::item! {
             #[derive(Debug, Clone)]
@@ -696,6 +705,8 @@ macro_rules! __plan_to_language {
         $($type_decl)*
 
         impl egg::Language for $name {
+            type Discriminant = std::mem::Discriminant<Self>;
+
             #[inline(always)]
             fn matches(&self, other: &Self) -> bool {
                 ::std::mem::discriminant(self) == ::std::mem::discriminant(other) &&
@@ -704,6 +715,7 @@ macro_rules! __plan_to_language {
 
             fn children(&self) -> &[egg::Id] { match self $children }
             fn children_mut(&mut self) -> &mut [egg::Id] { match self $children_mut }
+            fn discriminant(&self) -> Self::Discriminant { std::mem::discriminant(self) }
         }
 
         impl ::std::fmt::Display for $name {

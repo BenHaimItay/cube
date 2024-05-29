@@ -39,9 +39,11 @@ pub struct CubePlanCost {
     table_scans: i64,
     empty_wrappers: i64,
     non_detected_cube_scans: i64,
+    unwrapped_subqueries: usize,
     member_errors: i64,
     // TODO if pre-aggregation can be used for window functions, then it'd be suboptimal
     non_pushed_down_window: i64,
+    non_pushed_down_grouping_sets: i64,
     ungrouped_aggregates: usize,
     wrapper_nodes: i64,
     wrapped_select_ungrouped_scan: usize,
@@ -126,6 +128,8 @@ impl CubePlanCost {
             }) + other.non_detected_cube_scans,
             filter_members: self.filter_members + other.filter_members,
             non_pushed_down_window: self.non_pushed_down_window + other.non_pushed_down_window,
+            non_pushed_down_grouping_sets: self.non_pushed_down_grouping_sets
+                + other.non_pushed_down_grouping_sets,
             member_errors: self.member_errors + other.member_errors,
             cube_members: self.cube_members + other.cube_members,
             errors: self.errors + other.errors,
@@ -147,6 +151,7 @@ impl CubePlanCost {
             ast_size: self.ast_size + other.ast_size,
             ast_size_inside_wrapper: self.ast_size_inside_wrapper + other.ast_size_inside_wrapper,
             ungrouped_nodes: self.ungrouped_nodes + other.ungrouped_nodes,
+            unwrapped_subqueries: self.unwrapped_subqueries + other.unwrapped_subqueries,
         }
     }
 
@@ -163,6 +168,11 @@ impl CubePlanCost {
             filter_members: self.filter_members,
             member_errors: self.member_errors,
             non_pushed_down_window: self.non_pushed_down_window,
+            non_pushed_down_grouping_sets: match state {
+                CubePlanState::Wrapped => 0,
+                CubePlanState::Unwrapped(_) => self.non_pushed_down_grouping_sets,
+                CubePlanState::Wrapper => 0,
+            },
             cube_members: self.cube_members,
             errors: self.errors,
             structure_points: self.structure_points,
@@ -199,6 +209,7 @@ impl CubePlanCost {
                 }
                 CubePlanState::Wrapper => 0,
             } + self.ungrouped_aggregates,
+            unwrapped_subqueries: self.unwrapped_subqueries,
             wrapper_nodes: self.wrapper_nodes,
             wrapped_select_ungrouped_scan: self.wrapped_select_ungrouped_scan,
             cube_scan_nodes: self.cube_scan_nodes,
@@ -247,6 +258,11 @@ impl CostFunction<LogicalPlanLanguage> for BestCubePlan {
 
         let non_pushed_down_window = match enode {
             LogicalPlanLanguage::Window(_) => 1,
+            _ => 0,
+        };
+
+        let non_pushed_down_grouping_sets = match enode {
+            LogicalPlanLanguage::GroupingSetExpr(_) => 1,
             _ => 0,
         };
 
@@ -378,6 +394,11 @@ impl CostFunction<LogicalPlanLanguage> for BestCubePlan {
             _ => 0,
         };
 
+        let unwrapped_subqueries = match enode {
+            LogicalPlanLanguage::Subquery(_) => 1,
+            _ => 0,
+        };
+
         let initial_cost = CubePlanCostAndState {
             cost: CubePlanCost {
                 replacers: this_replacers,
@@ -387,6 +408,7 @@ impl CostFunction<LogicalPlanLanguage> for BestCubePlan {
                 non_detected_cube_scans,
                 member_errors,
                 non_pushed_down_window,
+                non_pushed_down_grouping_sets,
                 cube_members,
                 errors: this_errors,
                 time_dimensions_used_as_dimensions,
@@ -402,6 +424,7 @@ impl CostFunction<LogicalPlanLanguage> for BestCubePlan {
                 ast_size_without_alias,
                 ast_size: 1,
                 ungrouped_nodes,
+                unwrapped_subqueries,
             },
             state: match enode {
                 LogicalPlanLanguage::CubeScanWrapped(CubeScanWrapped(true)) => {

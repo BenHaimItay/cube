@@ -77,7 +77,7 @@ import {
 import { cachedHandler } from './cached-handler';
 import { createJWKsFetcher } from './jwk';
 import { SQLServer } from './sql-server';
-import { makeSchema } from './graphql';
+import { getJsonQueryFromGraphQLQuery, makeSchema } from './graphql';
 import { ConfigItem, prepareAnnotation } from './helpers/prepareAnnotation';
 import transformData from './helpers/transformData';
 import {
@@ -88,8 +88,6 @@ import {
   transformJoins,
   transformPreAggregations,
 } from './helpers/transformMetaExtended';
-
-const memberExpressionRegex = /^([a-zA-Z0-9_]+).([a-zA-Z0-9_]+):\(([a-zA-Z0-9_,]+)\):(.*)$/;
 
 function userAsyncHandler(handler: (req: Request & { context: ExtendedRequestContext }, res: ExpressResponse) => Promise<void>) {
   return (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
@@ -206,6 +204,31 @@ class ApiGateway {
     /** **************************************************************
      * graphql scope                                                 *
      *************************************************************** */
+
+    app.post(`${this.basePath}/v1/graphql-to-json`, userMiddlewares, async (req: any, res) => {
+      const { query, variables } = req.body;
+      const compilerApi = await this.getCompilerApi(req.context);
+
+      const metaConfig = await compilerApi.metaConfig({
+        requestId: req.context.requestId,
+      });
+
+      let schema = compilerApi.getGraphQLSchema();
+      if (!schema) {
+        schema = makeSchema(metaConfig);
+        compilerApi.setGraphQLSchema(schema);
+      }
+      
+      try {
+        const jsonQuery = getJsonQueryFromGraphQLQuery(query, metaConfig, variables);
+        res.json({ jsonQuery });
+      } catch (e: any) {
+        this.logger('GraphQL to JSON error', {
+          error: (e.stack || e).toString(),
+        });
+        res.json({ jsonQuery: null });
+      }
+    });
 
     app.use(
       `${this.basePath}/graphql`,
@@ -481,8 +504,9 @@ class ApiGateway {
   }
 
   private filterVisibleItemsInMeta(context: RequestContext, cubes: any[]) {
+    const isDevMode = getEnv('devMode');
     function visibilityFilter(item) {
-      return getEnv('devMode') || context.signedWithPlaygroundAuthSecret || item.isVisible;
+      return isDevMode || context.signedWithPlaygroundAuthSecret || item.isVisible;
     }
 
     return cubes
@@ -496,10 +520,11 @@ class ApiGateway {
       })).filter(cube => cube.config.measures?.length || cube.config.dimensions?.length || cube.config.segments?.length);
   }
 
-  public async meta({ context, res, includeCompilerId }: {
+  public async meta({ context, res, includeCompilerId, onlyCompilerId }: {
     context: RequestContext,
     res: MetaResponseResultFn,
-    includeCompilerId?: boolean
+    includeCompilerId?: boolean,
+    onlyCompilerId?: boolean
   }) {
     const requestStarted = new Date();
 
@@ -508,8 +533,16 @@ class ApiGateway {
       const compilerApi = await this.getCompilerApi(context);
       const metaConfig = await compilerApi.metaConfig({
         requestId: context.requestId,
-        includeCompilerId
+        includeCompilerId: includeCompilerId || onlyCompilerId
       });
+      if (onlyCompilerId) {
+        const response: { cubes: any[], compilerId?: string } = {
+          cubes: [],
+          compilerId: metaConfig.compilerId
+        };
+        res(response);
+        return;
+      }
       const cubesConfig = includeCompilerId ? metaConfig.cubes : metaConfig;
       const cubes = this.filterVisibleItemsInMeta(context, cubesConfig).map(cube => cube.config);
       const response: { cubes: any[], compilerId?: string } = { cubes };
@@ -1236,18 +1269,30 @@ class ApiGateway {
   }
 
   private parseMemberExpression(memberExpression: string): string | MemberExpression {
-    const match = memberExpression.match(memberExpressionRegex);
-    if (match) {
-      const args = match[3].split(',');
-      args.push(`return \`${match[4]}\``);
-      return {
-        cubeName: match[1],
-        name: match[2],
-        expressionName: match[2],
-        expression: Function.constructor.apply(null, args),
-        definition: memberExpression,
-      };
-    } else {
+    try {
+      if (memberExpression.startsWith('{')) {
+        const obj = JSON.parse(memberExpression);
+        const args = obj.cube_params;
+        args.push(`return \`${obj.expr}\``);
+
+        const groupingSet = obj.grouping_set ? {
+          groupType: obj.grouping_set.group_type,
+          id: obj.grouping_set.id,
+          subId: obj.grouping_set.sub_id ? obj.grouping_set.sub_id : undefined
+        } : undefined;
+
+        return {
+          cubeName: obj.cube_name,
+          name: obj.alias,
+          expressionName: obj.alias,
+          expression: Function.constructor.apply(null, args),
+          definition: memberExpression,
+          groupingSet,
+        };
+      } else {
+        return memberExpression;
+      }
+    } catch {
       return memberExpression;
     }
   }
@@ -1919,12 +1964,12 @@ class ApiGateway {
     };
   }
 
-  protected handleErrorMiddleware: ErrorRequestHandler = async (e, req, res, next) => {
+  protected handleErrorMiddleware: ErrorRequestHandler = async (e, req: Request, res, next) => {
     this.handleError({
       e,
       context: (<any>req).context,
       res: this.resToResultFn(res),
-      requestStarted: new Date(),
+      requestStarted: req.requestStarted || new Date(),
     });
 
     next(e);
@@ -2290,6 +2335,7 @@ class ApiGateway {
   protected requestContextMiddleware: RequestHandler = async (req: Request, res: ExpressResponse, next: NextFunction) => {
     try {
       req.context = await this.contextByReq(req, req.securityContext, getRequestIdFromRequest(req));
+      req.requestStarted = new Date();
       if (next) {
         next();
       }
