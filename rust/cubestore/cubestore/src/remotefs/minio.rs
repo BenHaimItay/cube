@@ -7,9 +7,9 @@ use chrono::{DateTime, Utc};
 use datafusion::cube_ext;
 use log::{debug, info};
 use regex::{NoExpand, Regex};
-use s3::creds::Credentials;
-use s3::{Bucket, Region};
-use std::env;
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::Region;
 use std::fmt;
 use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
@@ -23,137 +23,52 @@ use tokio::sync::Mutex;
 
 pub struct MINIORemoteFs {
     dir: PathBuf,
-    bucket: arc_swap::ArcSwap<Bucket>,
+    bucket: String,
+    region: Region,
+    s3_client: S3Client,
     sub_path: Option<String>,
     delete_mut: Mutex<()>,
 }
 
-//TODO Not if this needs any changes
 impl fmt::Debug for MINIORemoteFs {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let mut s = f.debug_struct("MINIORemoteFs");
-        s.field("dir", &self.dir).field("sub_path", &self.sub_path);
-        let bucket = self.bucket.load();
-        // Do not expose MINIO (secret) credentials.
-        s.field("bucket_name", &bucket.name)
-            .field("bucket_region", &bucket.region);
+        s.field("dir", &self.dir)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("sub_path", &self.sub_path);
         s.finish_non_exhaustive()
     }
 }
 
 impl MINIORemoteFs {
-    pub fn new(
+    pub async fn new(
         dir: PathBuf,
         bucket_name: String,
         sub_path: Option<String>,
     ) -> Result<Arc<Self>, CubeError> {
-        // Incorrect naming for ENV variables...
-        let access_key = env::var("CUBESTORE_MINIO_ACCESS_KEY_ID").ok();
-        let secret_key = env::var("CUBESTORE_MINIO_SECRET_ACCESS_KEY").ok();
+        // Load the region and endpoint from environment variables
+        let minio_server_endpoint = env::var("CUBESTORE_MINIO_SERVER_ENDPOINT").ok()
+            .ok_or_else(|| CubeError::user("CUBESTORE_MINIO_SERVER_ENDPOINT must be defined".to_string()))?;
 
-        if access_key.is_none() || secret_key.is_none() {
-            return Err(CubeError::user(
-                "Both CUBESTORE_MINIO_ACCESS_KEY_ID and CUBESTORE_MINIO_SECRET_ACCESS_KEY must be defined".to_string()
-            ));
-        }
+        let s3_region_id = env::var("CUBESTORE_MINIO_REGION").unwrap_or_else(|_| "".to_string());
 
-        let minio_server_endpoint = env::var("CUBESTORE_MINIO_SERVER_ENDPOINT").ok();
-        if minio_server_endpoint.is_none() {
-            return Err(CubeError::user(
-                "CUBESTORE_MINIO_SERVER_ENDPOINT must be defined".to_string(),
-            ));
-        }
+        let region_provider = RegionProviderChain::default_provider().or_else(Region::new(s3_region_id));
+        let config = aws_config::from_env().region(region_provider).endpoint(minio_server_endpoint).load().await;
+        let s3_client = S3Client::new(&config);
 
-        // Optional
-        let s3_region_id = env::var("CUBESTORE_MINIO_REGION").ok();
-
-        // We use direct construction of Credentials, because STS, profile, IAM is not supported
-        let credentials = Credentials {
-            access_key: access_key.clone(),
-            secret_key: secret_key.clone(),
-            security_token: None,
-            session_token: None,
-            expiration: None,
-        };
-
-        let region = Region::Custom {
-            region: s3_region_id.as_deref().unwrap_or("").to_string(),
-            endpoint: minio_server_endpoint
-                .as_deref()
-                .unwrap_or("localhost:")
-                .to_string(),
-        };
-        let bucket = Bucket::new(&bucket_name, region.clone(), credentials)?.with_path_style();
         let fs = Arc::new(Self {
             dir,
-            bucket: arc_swap::ArcSwap::new(Arc::new(bucket)),
+            bucket: bucket_name,
+            region: config.region().unwrap().clone(),
+            s3_client,
             sub_path,
             delete_mut: Mutex::new(()),
         });
-        spawn_creds_refresh_loop(access_key, secret_key, bucket_name, region, &fs);
 
         Ok(fs)
     }
 }
-
-fn spawn_creds_refresh_loop(
-    access_key: Option<String>,
-    secret_key: Option<String>,
-    bucket_name: String,
-    region: Region,
-    fs: &Arc<MINIORemoteFs>,
-) {
-    // Refresh credentials. TODO: use expiration time.
-    let refresh_every = refresh_interval_from_env();
-    if refresh_every.as_secs() == 0 {
-        return;
-    }
-
-    let fs = Arc::downgrade(fs);
-    std::thread::spawn(move || {
-        log::debug!("Started MINIO credentials refresh loop");
-        loop {
-            std::thread::sleep(refresh_every);
-            let fs = match fs.upgrade() {
-                None => {
-                    log::debug!("Stopping MINIO credentials refresh loop");
-                    return;
-                }
-                Some(fs) => fs,
-            };
-            let c = Credentials {
-                access_key: access_key.clone(),
-                secret_key: secret_key.clone(),
-                security_token: None,
-                session_token: None,
-                expiration: None,
-            };
-            let b = match Bucket::new(&bucket_name, region.clone(), c) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("Failed to refresh minIO credentials: {}", e);
-                    continue;
-                }
-            }
-            .with_path_style();
-            fs.bucket.swap(Arc::new(b));
-            log::debug!("Successfully refreshed minIO credentials")
-        }
-    });
-}
-
-fn refresh_interval_from_env() -> Duration {
-    let mut mins = 180; // 3 hours by default.
-    if let Ok(s) = std::env::var("CUBESTORE_MINIO_CREDS_REFRESH_EVERY_MINS") {
-        match s.parse::<u64>() {
-            Ok(i) => mins = i,
-            Err(e) => log::error!("Could not parse CUBESTORE_MINIO_CREDS_REFRESH_EVERY_MINS. Refreshing every {} minutes. Error: {}", mins, e),
-        };
-    };
-    Duration::from_secs(60 * mins)
-}
-
-di_service!(MINIORemoteFs, [RemoteFs]);
 
 #[async_trait]
 impl RemoteFs for MINIORemoteFs {
@@ -183,18 +98,15 @@ impl RemoteFs for MINIORemoteFs {
             debug!("Uploading {}", remote_path);
             let path = self.s3_path(&remote_path);
 
-            let bucket = self.bucket.load();
             let mut temp_upload_file = File::open(&temp_upload_path).await?;
-            let status_code = bucket
-                .put_object_stream(&mut temp_upload_file, path)
+            self.s3_client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&path)
+                .body(s3::ByteStream::from_path(temp_upload_path.clone()).await?)
+                .send()
                 .await?;
 
-            if status_code != 200 {
-                return Err(CubeError::user(format!(
-                    "minIO upload returned non OK status: {}",
-                    status_code
-                )));
-            }
             info!("Uploaded {} ({:?})", remote_path, time.elapsed()?);
         }
 
@@ -233,7 +145,6 @@ impl RemoteFs for MINIORemoteFs {
             let time = SystemTime::now();
             debug!("Downloading {}", remote_path);
             let path = self.s3_path(&remote_path);
-            let bucket = self.bucket.load();
 
             let (temp_file, temp_path) =
                 cube_ext::spawn_blocking(move || NamedTempFile::new_in(&downloads_dir))
@@ -241,15 +152,16 @@ impl RemoteFs for MINIORemoteFs {
                     .into_parts();
 
             let mut writter = File::from_std(temp_file);
-            let status_code = bucket
-                .get_object_stream(path.as_str(), &mut writter)
+
+            let resp = self.s3_client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&path)
+                .send()
                 .await?;
-            if status_code != 200 {
-                return Err(CubeError::user(format!(
-                    "minIO download returned non OK status: {}",
-                    status_code
-                )));
-            }
+
+            let mut body = resp.body.collect().await?;
+            writter.write_all(&body).await?;
 
             writter.flush().await?;
 
@@ -270,15 +182,13 @@ impl RemoteFs for MINIORemoteFs {
         info!("remote_path {}", remote_path);
         let path = self.s3_path(&remote_path);
         info!("path {}", remote_path);
-        let bucket = self.bucket.load();
-        let res = bucket.delete_object(path).await?;
 
-        if res.status_code() != 204 {
-            return Err(CubeError::user(format!(
-                "minIO delete returned non OK status: {}",
-                res.status_code()
-            )));
-        }
+        self.s3_client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&path)
+            .send()
+            .await?;
 
         let _guard = acquire_lock("delete file", self.delete_mut.lock()).await?;
         let local = self.dir.as_path().join(&remote_path);
@@ -306,24 +216,31 @@ impl RemoteFs for MINIORemoteFs {
         remote_prefix: String,
     ) -> Result<Vec<RemoteFile>, CubeError> {
         let path = self.s3_path(&remote_prefix);
-        let bucket = self.bucket.load();
-        let list = bucket.list(path, None).await?;
+
+        let list = self.s3_client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(path)
+            .send()
+            .await?;
+
         let leading_slash = Regex::new(format!("^{}", self.s3_path("")).as_str()).unwrap();
-        let result = list
-            .iter()
-            .flat_map(|res| {
-                res.contents
-                    .iter()
-                    .map(|o| -> Result<RemoteFile, CubeError> {
-                        Ok(RemoteFile {
-                            remote_path: leading_slash.replace(&o.key, NoExpand("")).to_string(),
-                            updated: DateTime::parse_from_rfc3339(&o.last_modified)?
-                                .with_timezone(&Utc),
-                            file_size: o.size,
-                        })
-                    })
+        let result = list.contents.unwrap_or_default()
+            .into_iter()
+            .map(|o| -> Result<RemoteFile, CubeError> {
+                let remote_path = leading_slash.replace(&o.key.unwrap_or_default(), NoExpand("")).to_string();
+                let updated = o.last_modified
+                    .map(|dt| dt.to_chrono())
+                    .unwrap_or_else(Utc::now);
+                let file_size = o.size.unwrap_or_default() as u64;
+
+                Ok(RemoteFile {
+                    remote_path,
+                    updated,
+                    file_size,
+                })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, CubeError>>()?;
         Ok(result)
     }
 
@@ -337,14 +254,14 @@ impl RemoteFs for MINIORemoteFs {
         Ok(buf.to_str().unwrap().to_string())
     }
 }
-//TODO
+
 impl MINIORemoteFs {
     fn s3_path(&self, remote_path: &str) -> String {
         format!(
-            "{}/{}",
+            "{}{}",
             self.sub_path
                 .as_ref()
-                .map(|p| p.to_string())
+                .map(|p| format!("{}/", p.to_string()))
                 .unwrap_or_else(|| "".to_string()),
             remote_path
         )

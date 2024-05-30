@@ -1,16 +1,10 @@
-use crate::app_metrics;
-use crate::di_service;
-use crate::remotefs::{CommonRemoteFsUtils, LocalDirRemoteFs, RemoteFile, RemoteFs};
-use crate::util::lock::acquire_lock;
-use crate::CubeError;
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::Region;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use datafusion::cube_ext;
 use log::{debug, info};
 use regex::{NoExpand, Regex};
-use s3::creds::Credentials;
-use s3::{Bucket, Region};
-use std::env;
 use std::fmt;
 use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
@@ -24,7 +18,9 @@ use tokio::sync::Mutex;
 
 pub struct S3RemoteFs {
     dir: PathBuf,
-    bucket: arc_swap::ArcSwap<Bucket>,
+    bucket: String,
+    region: Region,
+    s3_client: S3Client,
     sub_path: Option<String>,
     delete_mut: Mutex<()>,
 }
@@ -32,122 +28,37 @@ pub struct S3RemoteFs {
 impl fmt::Debug for S3RemoteFs {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let mut s = f.debug_struct("S3RemoteFs");
-        s.field("dir", &self.dir).field("sub_path", &self.sub_path);
-        let bucket = self.bucket.load();
-        // Do not expose AWS credentials.
-        s.field("bucket_name", &bucket.name)
-            .field("bucket_region", &bucket.region);
+        s.field("dir", &self.dir)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("sub_path", &self.sub_path);
         s.finish_non_exhaustive()
     }
 }
 
 impl S3RemoteFs {
-    pub fn new(
+    pub async fn new(
         dir: PathBuf,
         region: String,
         bucket_name: String,
         sub_path: Option<String>,
     ) -> Result<Arc<Self>, CubeError> {
-        // Incorrect naming for ENV variables...
-        let access_key = env::var("CUBESTORE_AWS_ACCESS_KEY_ID").ok();
-        let secret_key = env::var("CUBESTORE_AWS_SECRET_ACCESS_KEY").ok();
+        let region_provider = RegionProviderChain::default_provider().or_else(Region::new(region));
+        let config = aws_config::from_env().region(region_provider).load().await;
+        let s3_client = S3Client::new(&config);
 
-        let credentials = Credentials::new(
-            access_key.as_deref(),
-            secret_key.as_deref(),
-            None,
-            None,
-            None,
-        )
-        .map_err(|err| {
-            CubeError::internal(format!(
-                "Failed to create S3 credentials: {}",
-                err.to_string()
-            ))
-        })?;
-        let region = region.parse::<Region>().map_err(|err| {
-            CubeError::internal(format!(
-                "Failed to parse Region '{}': {}",
-                region,
-                err.to_string()
-            ))
-        })?;
-        let bucket = Bucket::new(&bucket_name, region.clone(), credentials)?;
         let fs = Arc::new(Self {
             dir,
-            bucket: arc_swap::ArcSwap::new(Arc::new(bucket)),
+            bucket: bucket_name,
+            region: config.region().unwrap().clone(),
+            s3_client,
             sub_path,
             delete_mut: Mutex::new(()),
         });
-        spawn_creds_refresh_loop(access_key, secret_key, bucket_name, region, &fs);
 
         Ok(fs)
     }
 }
-
-fn spawn_creds_refresh_loop(
-    access_key: Option<String>,
-    secret_key: Option<String>,
-    bucket_name: String,
-    region: Region,
-    fs: &Arc<S3RemoteFs>,
-) {
-    // Refresh credentials. TODO: use expiration time.
-    let refresh_every = refresh_interval_from_env();
-    if refresh_every.as_secs() == 0 {
-        return;
-    }
-
-    let fs = Arc::downgrade(fs);
-    std::thread::spawn(move || {
-        log::debug!("Started S3 credentials refresh loop");
-        loop {
-            std::thread::sleep(refresh_every);
-            let fs = match fs.upgrade() {
-                None => {
-                    log::debug!("Stopping S3 credentials refresh loop");
-                    return;
-                }
-                Some(fs) => fs,
-            };
-            let c = match Credentials::new(
-                access_key.as_deref(),
-                secret_key.as_deref(),
-                None,
-                None,
-                None,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to refresh S3 credentials: {}", e);
-                    continue;
-                }
-            };
-            let b = match Bucket::new(&bucket_name, region.clone(), c) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("Failed to refresh S3 credentials: {}", e);
-                    continue;
-                }
-            };
-            fs.bucket.swap(Arc::new(b));
-            log::debug!("Successfully refreshed S3 credentials")
-        }
-    });
-}
-
-fn refresh_interval_from_env() -> Duration {
-    let mut mins = 180; // 3 hours by default.
-    if let Ok(s) = std::env::var("CUBESTORE_AWS_CREDS_REFRESH_EVERY_MINS") {
-        match s.parse::<u64>() {
-            Ok(i) => mins = i,
-            Err(e) => log::error!("Could not parse CUBESTORE_AWS_CREDS_REFRESH_EVERY_MINS. Refreshing every {} minutes. Error: {}", mins, e),
-        };
-    };
-    Duration::from_secs(60 * mins)
-}
-
-di_service!(S3RemoteFs, [RemoteFs]);
 
 #[async_trait]
 impl RemoteFs for S3RemoteFs {
@@ -184,18 +95,15 @@ impl RemoteFs for S3RemoteFs {
             let time = SystemTime::now();
             debug!("Uploading {}", remote_path);
             let path = self.s3_path(&remote_path);
-            let bucket = self.bucket.load();
             let mut temp_upload_file = File::open(&temp_upload_path).await?;
 
-            let status_code = bucket
-                .put_object_stream(&mut temp_upload_file, path)
+            self.s3_client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&path)
+                .body(s3::ByteStream::from_path(temp_upload_path.clone()).await?)
+                .send()
                 .await?;
-            if status_code != 200 {
-                return Err(CubeError::user(format!(
-                    "S3 upload returned non OK status: {}",
-                    status_code
-                )));
-            }
 
             info!("Uploaded {} ({:?})", remote_path, time.elapsed()?);
         }
@@ -241,7 +149,6 @@ impl RemoteFs for S3RemoteFs {
             let time = SystemTime::now();
             debug!("Downloading {}", remote_path);
             let path = self.s3_path(&remote_path);
-            let bucket = self.bucket.load();
 
             let (temp_file, temp_path) =
                 cube_ext::spawn_blocking(move || NamedTempFile::new_in(&downloads_dir))
@@ -249,15 +156,16 @@ impl RemoteFs for S3RemoteFs {
                     .into_parts();
 
             let mut writter = File::from_std(temp_file);
-            let status_code = bucket
-                .get_object_stream(path.as_str(), &mut writter)
+
+            let resp = self.s3_client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&path)
+                .send()
                 .await?;
-            if status_code != 200 {
-                return Err(CubeError::user(format!(
-                    "S3 download returned non OK status: {}",
-                    status_code
-                )));
-            }
+
+            let mut body = resp.body.collect().await?;
+            writter.write_all(&body).await?;
 
             writter.flush().await?;
 
@@ -283,15 +191,13 @@ impl RemoteFs for S3RemoteFs {
         let time = SystemTime::now();
         debug!("Deleting {}", remote_path);
         let path = self.s3_path(&remote_path);
-        let bucket = self.bucket.load();
 
-        let res = bucket.delete_object(path).await?;
-        if res.status_code() != 204 {
-            return Err(CubeError::user(format!(
-                "S3 delete returned non OK status: {}",
-                res.status_code()
-            )));
-        }
+        self.s3_client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&path)
+            .send()
+            .await?;
 
         let _guard = acquire_lock("delete file", self.delete_mut.lock()).await?;
         let local = self.dir.as_path().join(&remote_path);
@@ -319,32 +225,31 @@ impl RemoteFs for S3RemoteFs {
         remote_prefix: String,
     ) -> Result<Vec<RemoteFile>, CubeError> {
         let path = self.s3_path(&remote_prefix);
-        let bucket = self.bucket.load();
-        let list = bucket.list(path, None).await?;
-        let pages_count = list.len();
-        app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
-            pages_count as i64,
-            Some(&vec!["operation:list".to_string(), "driver:s3".to_string()]),
-        );
-        if pages_count > 100 {
-            log::warn!("S3 list returned more than 100 pages: {}", pages_count);
-        }
+
+        let list = self.s3_client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(path)
+            .send()
+            .await?;
+
         let leading_slash = Regex::new(format!("^{}", self.s3_path("")).as_str()).unwrap();
-        let result = list
-            .iter()
-            .flat_map(|res| {
-                res.contents
-                    .iter()
-                    .map(|o| -> Result<RemoteFile, CubeError> {
-                        Ok(RemoteFile {
-                            remote_path: leading_slash.replace(&o.key, NoExpand("")).to_string(),
-                            updated: DateTime::parse_from_rfc3339(&o.last_modified)?
-                                .with_timezone(&Utc),
-                            file_size: o.size,
-                        })
-                    })
+        let result = list.contents.unwrap_or_default()
+            .into_iter()
+            .map(|o| -> Result<RemoteFile, CubeError> {
+                let remote_path = leading_slash.replace(&o.key.unwrap_or_default(), NoExpand("")).to_string();
+                let updated = o.last_modified
+                    .map(|dt| dt.to_chrono())
+                    .unwrap_or_else(Utc::now);
+                let file_size = o.size.unwrap_or_default() as u64;
+
+                Ok(RemoteFile {
+                    remote_path,
+                    updated,
+                    file_size,
+                })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, CubeError>>()?;
         Ok(result)
     }
 
